@@ -4,14 +4,14 @@ using UnityEngine.InputSystem;
 [RequireComponent(typeof(Rigidbody))]
 public class PlayerController : MonoBehaviour
 {
-    
+
     [Header("Movement")]
     [SerializeField, Min(0)] private float movementSpeed = 8f;
     [SerializeField, Min(0)] private float rotationSpeed = 10f;
     [SerializeField, Min(0)] private float positionChangeSharpness = 9f;
     [SerializeField, Min(0)] private float minimumPositionChange = 0.01f;
     [SerializeField, Min(0)] private float minimumRotationChange = 0.5f;
-    
+
     [Header("Surface Detection")]
     [SerializeField] private LayerMask surfaceLayer;
     [SerializeField, Min(0)] private float surfaceOffset = 0.2f;
@@ -22,25 +22,39 @@ public class PlayerController : MonoBehaviour
     [SerializeField, Min(1)] private float groundCheckDistance = 10f;
     [SerializeField, Min(0)] private float groundCheckRadius = 0.3f;
     [SerializeField, Min(0)] private float groundCheckRecoverySpeed = 15f;
-    
+
     [Header("Camera")]
     [SerializeField] private Transform playerCamera;
 
+    [Header("Safety")]
+    [SerializeField] private bool useKinematicBody = true;
+    [SerializeField, Min(0)] private float noSurfaceRecoveryDelay = 0.5f;
+    [SerializeField, Min(1)] private float worldLimitRadius = 200f;
+    [SerializeField, Min(0.05f)] private float validPoseRecordInterval = 0.25f;
+
     private Rigidbody rb;
     private bool disableGravity = true; // <--- (rose) Disable this if you want to add jump, but always re-enable it the moment we touch ground
-    // NOTE: If you add jump, make sure to always orient the player's transform.up to be Vector3.up in world space, so that the ground check works properly :)
-    // Why? Because if we end up upside down or sideways, there's no guarantee we will find a surface. Maybe we can add a system that if you can't find ground for X seconds, we re-orient the player to stand up
-    
+                                        // NOTE: If you add jump, make sure to always orient the player's transform.up to be Vector3.up in world space, so that the ground check works properly :)
+                                        // Why? Because if we end up upside down or sideways, there's no guarantee we will find a surface. Maybe we can add a system that if you can't find ground for X seconds, we re-orient the player to stand up
+
     // The normal of the surface the bug is currently walking on. We assume UP, but if we choose to spawn the player sideways, you have to change this!
     private Vector3 currentSurfaceNormal = Vector3.up;
-    
+
     private Vector3 moveInput;
     private Vector3 targetForward;
     private Vector3 lastMoveInput;
 
+    private Vector3 lastValidPosition;
+    private Quaternion lastValidRotation;
+    private Vector3 lastValidNormal = Vector3.up;
+    private Vector3 lastValidForward;
+    private float timeWithoutSurface;
+    private float nextValidPoseRecordTime;
+
     private void Awake()
     {
         rb = GetComponent<Rigidbody>();
+        rb.isKinematic = useKinematicBody;
 
         if (disableGravity)
         {
@@ -48,8 +62,13 @@ public class PlayerController : MonoBehaviour
         }
 
         rb.interpolation = RigidbodyInterpolation.Interpolate;
-        
+
         targetForward = Vector3.ProjectOnPlane(rb.rotation * Vector3.forward, currentSurfaceNormal).normalized;
+
+        lastValidPosition = rb.position;
+        lastValidRotation = rb.rotation;
+        lastValidNormal = currentSurfaceNormal;
+        lastValidForward = targetForward;
     }
 
     private Vector3 GetMoveInput()
@@ -75,9 +94,15 @@ public class PlayerController : MonoBehaviour
     {
         moveInput = GetMoveInput();
     }
-    
+
     private void FixedUpdate()
     {
+        if (!rb.isKinematic)
+        {
+            rb.linearVelocity = Vector3.zero;
+            rb.angularVelocity = Vector3.zero;
+        }
+
         bool isMoving = moveInput.sqrMagnitude > 0.001f;
 
         UpdateTargetFacingWithCamera(isMoving);
@@ -86,12 +111,18 @@ public class PlayerController : MonoBehaviour
 
     private void ProceduralMovement(bool isMoving)
     {
+        if (!IsFinite(rb.position) || rb.position.sqrMagnitude > worldLimitRadius * worldLimitRadius)
+        {
+            RestoreLastValidPose();
+            return;
+        }
+
         // Check if we are trying to rotate while also going forward
         Quaternion headingRotation = Quaternion.LookRotation(targetForward, currentSurfaceNormal);
         float rotationLerp = 1f - Mathf.Exp(-rotationSpeed * Time.fixedDeltaTime);
         Quaternion newRotation = Quaternion.Slerp(rb.rotation, headingRotation, rotationLerp);
         Vector3 rotatedDirection = Vector3.ProjectOnPlane(newRotation * Vector3.forward, currentSurfaceNormal).normalized;
-        
+
         // If we do have a rotation happening, then we use rotatedDirection over targetForward, otherwise, continue using targetForward
         if (rotatedDirection.sqrMagnitude < 0.001f)
         {
@@ -100,7 +131,7 @@ public class PlayerController : MonoBehaviour
 
         // Calculate the target new position if we're moving (if not moving we still want to do ground checks and other potential safety checks)
         Vector3 targetPosition = rb.position;
-        if (isMoving) 
+        if (isMoving)
         {
             targetPosition += rotatedDirection * movementSpeed * Time.fixedDeltaTime;
         }
@@ -128,9 +159,17 @@ public class PlayerController : MonoBehaviour
             recoveredWithGroundCheck = foundSurface;
         }
 
-        // NO SURFACE FOUND! (stop movement, but something wrong is happening... TODO: Maybe should respawn player or something in this case)
+        // NO SURFACE FOUND! (stop movement, but something wrong is happening...)
         if (!foundSurface)
         {
+            timeWithoutSurface += Time.fixedDeltaTime;
+
+            if (timeWithoutSurface >= noSurfaceRecoveryDelay)
+            {
+                RestoreLastValidPose();
+                return;
+            }
+
             if (Quaternion.Angle(rb.rotation, newRotation) > minimumRotationChange)
             {
                 rb.MoveRotation(newRotation);
@@ -138,6 +177,8 @@ public class PlayerController : MonoBehaviour
 
             return;
         }
+
+        timeWithoutSurface = 0f;
 
         // For smoothe transition onto surfaces, SLERP that normal (use arcHit.normal directly if you don't want that smooth transition)
         float normalLerp = 1f - Mathf.Exp(-rotationSpeed * Time.fixedDeltaTime);
@@ -178,6 +219,58 @@ public class PlayerController : MonoBehaviour
         {
             rb.MovePosition(finalPosition);
         }
+
+        if (Time.time >= nextValidPoseRecordTime && IsFinite(finalPosition))
+        {
+            lastValidPosition = finalPosition;
+            lastValidRotation = finalRotation;
+            lastValidNormal = currentSurfaceNormal;
+            lastValidForward = targetForward;
+            nextValidPoseRecordTime = Time.time + validPoseRecordInterval;
+        }
+    }
+
+    private void RestoreLastValidPose()
+    {
+        if (!rb.isKinematic)
+        {
+            rb.linearVelocity = Vector3.zero;
+            rb.angularVelocity = Vector3.zero;
+        }
+
+        rb.position = lastValidPosition;
+        rb.rotation = lastValidRotation;
+        transform.SetPositionAndRotation(lastValidPosition, lastValidRotation);
+
+        currentSurfaceNormal = lastValidNormal;
+        targetForward = lastValidForward;
+        timeWithoutSurface = 0f;
+    }
+
+    private bool IsUsableHit(RaycastHit hit)
+    {
+        if (hit.collider == null)
+        {
+            return false;
+        }
+
+        if (hit.collider.attachedRigidbody == rb)
+        {
+            return false;
+        }
+
+        if (hit.distance <= 0f && hit.point == Vector3.zero)
+        {
+            return false;
+        }
+
+        return IsFinite(hit.normal) && hit.normal.sqrMagnitude > 0.5f;
+    }
+
+    private static bool IsFinite(Vector3 value)
+    {
+        return !(float.IsNaN(value.x) || float.IsNaN(value.y) || float.IsNaN(value.z)
+            || float.IsInfinity(value.x) || float.IsInfinity(value.y) || float.IsInfinity(value.z));
     }
 
     private void UpdateTargetFacingWithCamera(bool isMoving)
@@ -211,7 +304,7 @@ public class PlayerController : MonoBehaviour
             lastMoveInput = moveInput;
         }
     }
-    
+
     private bool CheckForGround(out RaycastHit hit)
     {
         hit = new RaycastHit();
@@ -225,13 +318,18 @@ public class PlayerController : MonoBehaviour
         Vector3 direction = -currentSurfaceNormal;
         Vector3 origin = groundCheck.position;
 
-        bool foundSurface = Physics.SphereCast(origin, groundCheckRadius, direction, out hit, groundCheckDistance, surfaceLayer, QueryTriggerInteraction.Ignore);
+        bool foundSurface = Physics.SphereCast(origin, groundCheckRadius, direction, out hit, groundCheckDistance, surfaceLayer, QueryTriggerInteraction.Ignore) && IsUsableHit(hit);
+
+        if (!foundSurface)
+        {
+            foundSurface = Physics.Raycast(origin, direction, out hit, groundCheckDistance, surfaceLayer, QueryTriggerInteraction.Ignore) && IsUsableHit(hit);
+        }
 
         Debug.DrawRay(origin, direction * groundCheckDistance, foundSurface ? Color.green : Color.red);
 
         return foundSurface;
     }
-    
+
     private bool TryFindSurfaceAhead(Vector3 position, Vector3 forward, Vector3 surfaceNormal, float radius, LayerMask layer, out RaycastHit hit)
     {
         // Look ahead and toward the direction the bug needs to climb.
@@ -241,30 +339,30 @@ public class PlayerController : MonoBehaviour
         Vector3 direction = -surfaceNormal;
         float distance = radius * 4f;
 
-        bool foundSurface = Physics.SphereCast(origin, 0.1f, direction, out hit, distance, layer, QueryTriggerInteraction.Ignore);
+        bool foundSurface = Physics.SphereCast(origin, 0.1f, direction, out hit, distance, layer, QueryTriggerInteraction.Ignore) && IsUsableHit(hit);
 
-        Debug.DrawRay(origin, direction * distance, foundSurface ? Color.cyan : Color.yellow, 0.1f );
+        Debug.DrawRay(origin, direction * distance, foundSurface ? Color.cyan : Color.yellow, 0.1f);
 
         return foundSurface;
     }
 
-    private bool PerformCurvedRaycast(Vector3 center, Vector3 forward, Vector3 up, float angle, 
+    private bool PerformCurvedRaycast(Vector3 center, Vector3 forward, Vector3 up, float angle,
         float radius, int resolution, LayerMask layer, out RaycastHit hit)
     {
         // Orient the arc toward the movement direction.
         Quaternion rotation = Quaternion.LookRotation(forward, up);
-        
-        rotation *= Quaternion.Euler(-angle/2, 0f, 0f);
+
+        rotation *= Quaternion.Euler(-angle / 2, 0f, 0f);
 
         for (int i = 0; i < resolution; i++)
         {
             Vector3 A = center + rotation * Vector3.forward * radius;
-            rotation *= Quaternion.Euler(angle/resolution, 0f, 0f);
+            rotation *= Quaternion.Euler(angle / resolution, 0f, 0f);
             Vector3 B = center + rotation * Vector3.forward * radius;
             Vector3 AB = B - A;
 
-            bool didHit = Physics.Raycast(A, AB.normalized, out hit, AB.magnitude * 1.001f, layer);
-            
+            bool didHit = Physics.Raycast(A, AB.normalized, out hit, AB.magnitude * 1.001f, layer, QueryTriggerInteraction.Ignore) && IsUsableHit(hit);
+
             // Visualize the raycast.
             Debug.DrawLine(A, didHit ? hit.point : B, didHit ? Color.green : Color.red);
 
@@ -273,7 +371,7 @@ public class PlayerController : MonoBehaviour
                 return true;
             }
         }
-        
+
         hit = new RaycastHit();
         return false;
     }
